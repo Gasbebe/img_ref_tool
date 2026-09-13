@@ -1,6 +1,8 @@
 mod app;
 #[cfg(target_os = "macos")]
 mod platform_macos;
+#[cfg(target_os = "windows")]
+mod platform_windows;
 mod storage;
 
 use app::ReferenceBoardApp;

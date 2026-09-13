@@ -491,7 +491,9 @@ impl ReferenceBoardApp {
 
         #[cfg(target_os = "macos")]
         let browser_drops = crate::platform_macos::install(creation_context);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        let browser_drops = crate::platform_windows::install(creation_context);
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let browser_drops = None;
 
         Self {
