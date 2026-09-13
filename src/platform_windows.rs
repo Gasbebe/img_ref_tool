@@ -2,26 +2,25 @@
 
 //! Windows counterpart to `platform_macos`. Browsers commonly drag images
 //! out without ever placing a real file path (`CF_HDROP`) on the drop data
-//! object -- only a registered "PNG" clipboard format (which Chromium-based
-//! browsers place for image drags) or raw bitmap data. Windows only allows
-//! one `IDropTarget` registered per HWND (unlike macOS, where views can be
-//! stacked and each register for different pasteboard types), so instead of
-//! adding a second target we revoke winit's own registration and install one
-//! that handles both cases ourselves: local file paths (`CF_HDROP`, the same
-//! format winit read) and the registered "PNG" format for browser images.
-//!
-//! Scope note: sources that place only a raw `CF_DIB`/`CF_DIBV5` bitmap with
-//! no "PNG" format (rare for photos, more likely for icons or older browsers)
-//! aren't handled -- reconstructing a valid BMP from an arbitrary `CF_DIB`
-//! payload needs palette-aware header math that isn't worth the risk here.
-//! Clipboard paste (`app::handle_clipboard_paste`) covers that gap.
+//! object. Confirmed by logging every format Chrome actually offers during
+//! an image drag: no `CF_HDROP`, no registered "PNG" format either -- just
+//! the classic OLE "virtual file" pair, `FileGroupDescriptorW` (an HGLOBAL
+//! listing one or more virtual filenames) and `FileContents` (the bytes for
+//! one of those, delivered as an `IStream`, requested per index via
+//! `lindex`). Windows only allows one `IDropTarget` registered per HWND
+//! (unlike macOS, where views can be stacked and each register for
+//! different pasteboard types), so instead of adding a second target we
+//! revoke winit's own registration and install one that handles all three
+//! cases ourselves: local file paths (`CF_HDROP`, the same format winit
+//! read), the registered "PNG" format (present on some sites/browsers), and
+//! the `FileGroupDescriptorW`/`FileContents` virtual-file pair.
 
 use std::path::PathBuf;
 
 use windows::core::{implement, Ref, Result as WinResult, PCWSTR};
 use windows::Win32::Foundation::{HGLOBAL, HWND, POINTL};
 use windows::Win32::System::Com::{
-    IDataObject, DATADIR_GET, DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL,
+    IDataObject, IStream, DATADIR_GET, DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL, TYMED_ISTREAM,
 };
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
@@ -30,7 +29,7 @@ use windows::Win32::System::Ole::{
     DROPEFFECT_NONE, IDropTarget, IDropTarget_Impl,
 };
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
-use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+use windows::Win32::UI::Shell::{DragQueryFileW, FILEDESCRIPTORW, HDROP};
 use raw_window_handle::HasWindowHandle;
 
 use crate::app::BrowserDropQueue;
@@ -127,12 +126,14 @@ fn log_available_formats(data_object: &IDataObject) {
 }
 
 /// Reads whatever the data object offers as encoded image bytes: local file
-/// paths (read straight off disk) plus the registered "PNG" format browsers
-/// place for dragged images.
+/// paths (read straight off disk), the registered "PNG" format some
+/// sites/browsers place for dragged images, and the OLE virtual-file pair
+/// Chrome actually uses (`FileGroupDescriptorW` + `FileContents`).
 fn read_dropped_items(data_object: &IDataObject) -> Vec<Vec<u8>> {
     let mut items = Vec::new();
     items.extend(read_file_paths(data_object).into_iter().filter_map(|path| std::fs::read(path).ok()));
-    let png_format = png_clipboard_format();
+
+    let png_format = registered_format("PNG");
     match read_global_format(data_object, png_format) {
         Some(png) => {
             eprintln!(
@@ -143,14 +144,111 @@ fn read_dropped_items(data_object: &IDataObject) -> Vec<Vec<u8>> {
         }
         None => eprintln!("[img-ref-tool] drag: no data for PNG format {png_format}"),
     }
+
+    let virtual_files = read_virtual_files(data_object);
+    eprintln!(
+        "[img-ref-tool] drag: read {} virtual file(s)",
+        virtual_files.len()
+    );
+    items.extend(virtual_files);
+
     items
 }
 
-fn png_clipboard_format() -> u16 {
-    let wide_name: Vec<u16> = "PNG".encode_utf16().chain(std::iter::once(0)).collect();
+fn registered_format(name: &str) -> u16 {
+    let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: `wide_name` is a valid, null-terminated UTF-16 string that
     // outlives this call.
     (unsafe { RegisterClipboardFormatW(PCWSTR(wide_name.as_ptr())) }) as u16
+}
+
+/// Reads the classic OLE "virtual file" drag pair: `FileGroupDescriptorW`
+/// lists how many virtual files there are (and their names, though we don't
+/// need those), and `FileContents` gives the bytes for item `i` via an
+/// `IStream` when requested with `lindex = i`.
+fn read_virtual_files(data_object: &IDataObject) -> Vec<Vec<u8>> {
+    let descriptor_format = registered_format("FileGroupDescriptorW");
+    let Some(descriptor_bytes) = read_global_format(data_object, descriptor_format) else {
+        eprintln!("[img-ref-tool] drag: no FileGroupDescriptorW ({descriptor_format})");
+        return Vec::new();
+    };
+    if descriptor_bytes.len() < 4 {
+        return Vec::new();
+    }
+    let count = u32::from_ne_bytes(descriptor_bytes[0..4].try_into().unwrap()) as usize;
+    eprintln!("[img-ref-tool] drag: FileGroupDescriptorW lists {count} item(s)");
+
+    let contents_format = registered_format("FileContents");
+    let entry_size = std::mem::size_of::<FILEDESCRIPTORW>();
+    let mut files = Vec::new();
+    for index in 0..count {
+        // We only need the byte count check to avoid reading past the
+        // buffer; the file name/attributes in each entry aren't used.
+        if 4 + (index + 1) * entry_size > descriptor_bytes.len() {
+            break;
+        }
+        match read_file_contents(data_object, contents_format, index as i32) {
+            Some(bytes) => {
+                eprintln!(
+                    "[img-ref-tool] drag: FileContents[{index}] = {} byte(s)",
+                    bytes.len()
+                );
+                files.push(bytes);
+            }
+            None => eprintln!("[img-ref-tool] drag: no data for FileContents[{index}]"),
+        }
+    }
+    files
+}
+
+fn read_file_contents(data_object: &IDataObject, format: u16, index: i32) -> Option<Vec<u8>> {
+    let format_etc = FORMATETC {
+        cfFormat: format,
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT.0,
+        lindex: index,
+        tymed: (TYMED_ISTREAM.0 as u32) | (TYMED_HGLOBAL.0 as u32),
+    };
+    // SAFETY: `format_etc` describes a well-formed request; `GetData` gives
+    // back an owned `STGMEDIUM` that we release ourselves below.
+    let mut medium = unsafe { data_object.GetData(&format_etc) }.ok()?;
+    let bytes = if medium.tymed == TYMED_ISTREAM.0 as u32 {
+        // SAFETY: `tymed` says the `pstm` union field is active.
+        unsafe { medium.u.pstm.as_ref() }.and_then(read_stream_to_vec)
+    } else if medium.tymed == TYMED_HGLOBAL.0 as u32 {
+        // SAFETY: `tymed` says the `hGlobal` union field is active.
+        copy_global(unsafe { medium.u.hGlobal })
+    } else {
+        None
+    };
+    // SAFETY: `medium` came from `GetData` above and is only released once.
+    unsafe { ReleaseStgMedium(&mut medium) };
+    bytes
+}
+
+fn read_stream_to_vec(stream: &IStream) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let mut read = 0u32;
+        // SAFETY: `buffer` is valid for `buffer.len()` bytes for the
+        // duration of the call.
+        let hr = unsafe {
+            stream.Read(
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+                Some(&mut read),
+            )
+        };
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read as usize]);
+        if hr.is_err() {
+            break;
+        }
+    }
+    if bytes.is_empty() { None } else { Some(bytes) }
 }
 
 fn read_global_format(data_object: &IDataObject, format: u16) -> Option<Vec<u8>> {
