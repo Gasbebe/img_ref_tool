@@ -20,7 +20,9 @@ use std::path::PathBuf;
 
 use windows::core::{implement, Ref, Result as WinResult, PCWSTR};
 use windows::Win32::Foundation::{HGLOBAL, HWND, POINTL};
-use windows::Win32::System::Com::{IDataObject, DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL};
+use windows::Win32::System::Com::{
+    IDataObject, DATADIR_GET, DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL,
+};
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::System::Ole::{
@@ -46,9 +48,17 @@ impl IDropTarget_Impl for DropTarget_Impl {
         _pt: &POINTL,
         effect: *mut DROPEFFECT,
     ) -> WinResult<()> {
-        let accepts = data_object
-            .as_ref()
-            .is_some_and(|data_object| !read_dropped_items(data_object).is_empty());
+        let accepts = match data_object.as_ref() {
+            Some(data_object) => {
+                log_available_formats(data_object);
+                !read_dropped_items(data_object).is_empty()
+            }
+            None => {
+                eprintln!("[img-ref-tool] drag: DragEnter got a null data object");
+                false
+            }
+        };
+        eprintln!("[img-ref-tool] drag: DragEnter accepts={accepts}");
         unsafe {
             *effect = if accepts { DROPEFFECT_COPY } else { DROPEFFECT_NONE };
         }
@@ -86,10 +96,33 @@ impl IDropTarget_Impl for DropTarget_Impl {
             return Ok(());
         };
         let items = read_dropped_items(data_object);
+        eprintln!("[img-ref-tool] drag: Drop produced {} item(s)", items.len());
         if let Ok(mut queue) = self.queue.lock() {
             queue.extend(items);
         }
         Ok(())
+    }
+}
+
+/// Diagnostic: prints every clipboard format the drag data object offers,
+/// so we can see what a given browser/site actually places on the drag
+/// (as opposed to what we currently know how to read).
+fn log_available_formats(data_object: &IDataObject) {
+    let Ok(enum_formats) = (unsafe { data_object.EnumFormatEtc(DATADIR_GET.0 as u32) }) else {
+        eprintln!("[img-ref-tool] drag: EnumFormatEtc failed");
+        return;
+    };
+    loop {
+        let mut buffer = [FORMATETC::default()];
+        let mut fetched = 0u32;
+        let hr = unsafe { enum_formats.Next(&mut buffer, Some(&mut fetched)) };
+        if hr.is_err() || fetched == 0 {
+            break;
+        }
+        eprintln!(
+            "[img-ref-tool] drag: offered cfFormat={} tymed={}",
+            buffer[0].cfFormat, buffer[0].tymed
+        );
     }
 }
 
@@ -99,8 +132,16 @@ impl IDropTarget_Impl for DropTarget_Impl {
 fn read_dropped_items(data_object: &IDataObject) -> Vec<Vec<u8>> {
     let mut items = Vec::new();
     items.extend(read_file_paths(data_object).into_iter().filter_map(|path| std::fs::read(path).ok()));
-    if let Some(png) = read_global_format(data_object, png_clipboard_format()) {
-        items.push(png);
+    let png_format = png_clipboard_format();
+    match read_global_format(data_object, png_format) {
+        Some(png) => {
+            eprintln!(
+                "[img-ref-tool] drag: read {} byte(s) from PNG format {png_format}",
+                png.len()
+            );
+            items.push(png);
+        }
+        None => eprintln!("[img-ref-tool] drag: no data for PNG format {png_format}"),
     }
     items
 }
@@ -192,11 +233,18 @@ pub fn install(cc: &eframe::CreationContext<'_>) -> Option<BrowserDropQueue> {
     // SAFETY: `hwnd` is the live window eframe just created on this thread;
     // OLE is already initialized (winit's own drag-and-drop needed it to
     // register in the first place).
-    unsafe {
+    let registered = unsafe {
         // Ignore failure: if winit didn't register one for some reason,
         // revoking is a harmless no-op.
         let _ = RevokeDragDrop(hwnd);
-        RegisterDragDrop(hwnd, &target).ok()?;
+        RegisterDragDrop(hwnd, &target)
+    };
+    match registered {
+        Ok(()) => eprintln!("[img-ref-tool] drag: RegisterDragDrop succeeded"),
+        Err(error) => {
+            eprintln!("[img-ref-tool] drag: RegisterDragDrop failed: {error}");
+            return None;
+        }
     }
 
     Some(queue)

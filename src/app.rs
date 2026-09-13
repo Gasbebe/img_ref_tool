@@ -625,17 +625,42 @@ impl ReferenceBoardApp {
         };
     }
 
-    /// Cmd+V (Ctrl+V on non-mac): pastes an image copied from a browser
-    /// ("Copy Image" on Chrome/Pinterest/etc.) via the system clipboard.
+    /// Cmd/Ctrl+V: pastes an image copied from a browser ("Copy Image" on
+    /// Chrome/Pinterest/etc.) via the system clipboard.
+    ///
+    /// egui-winit intercepts every Ctrl/Cmd+V itself (to fire `Event::Paste`
+    /// for *text*) and never forwards a plain `Event::Key` for it, so we
+    /// can't detect the shortcut with `consume_key`. It only emits
+    /// `Event::Paste` when the clipboard also holds non-empty text -- many
+    /// sites' "Copy image" does place the image URL as a text fallback, so
+    /// this catches the shortcut when that happens. When the clipboard holds
+    /// *only* image bytes and no text at all, no event reaches us here, so
+    /// the "Paste Image" entry in the right-click menu is the guaranteed
+    /// fallback (see `ui()`).
     fn handle_clipboard_paste(&mut self, ctx: &egui::Context, canvas_rect: Rect) {
         if self.editing.is_some() || self.pending.is_some() {
             return;
         }
-        let pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::V));
-        if !pressed {
+        let pasted = ctx.input(|i| {
+            i.events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Paste(_)))
+        });
+        if !pasted {
             return;
         }
 
+        let screen_position = ctx
+            .input(|i| i.pointer.hover_pos())
+            .unwrap_or(canvas_rect.center());
+        let world_position = self.camera.screen_to_world(screen_position, canvas_rect);
+        self.paste_image_from_clipboard(ctx, world_position);
+    }
+
+    /// Reads an image off the system clipboard and drops it at
+    /// `world_position`. Shared by the (best-effort) Cmd/Ctrl+V handler
+    /// above and the always-available "Paste Image" context-menu entry.
+    fn paste_image_from_clipboard(&mut self, ctx: &egui::Context, world_position: Pos2) {
         let mut clipboard = match arboard::Clipboard::new() {
             Ok(clipboard) => clipboard,
             Err(error) => {
@@ -666,10 +691,6 @@ impl ReferenceBoardApp {
             return;
         }
 
-        let screen_position = ctx
-            .input(|i| i.pointer.hover_pos())
-            .unwrap_or(canvas_rect.center());
-        let world_position = self.camera.screen_to_world(screen_position, canvas_rect);
         let (loaded, failures) = self.insert_images_from_bytes(
             ctx,
             vec![(encoded, "Pasted image".to_owned())],
@@ -890,15 +911,18 @@ impl eframe::App for ReferenceBoardApp {
         let canvas_rect = ui.max_rect();
         let response = ui.allocate_rect(canvas_rect, Sense::click_and_drag());
         response.context_menu(|ui| {
+            let menu_world_position = self.camera.screen_to_world(
+                response
+                    .interact_pointer_pos()
+                    .unwrap_or(canvas_rect.center()),
+                canvas_rect,
+            );
             if ui.button("Add Note").clicked() {
-                self.add_note(
-                    self.camera.screen_to_world(
-                        response
-                            .interact_pointer_pos()
-                            .unwrap_or(canvas_rect.center()),
-                        canvas_rect,
-                    ),
-                );
+                self.add_note(menu_world_position);
+                ui.close();
+            }
+            if ui.button("Paste Image").clicked() {
+                self.paste_image_from_clipboard(ui.ctx(), menu_world_position);
                 ui.close();
             }
         });
