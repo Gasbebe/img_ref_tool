@@ -30,6 +30,62 @@ pub struct ReferenceBoardApp {
     history: History,
     edit_before: Option<Vec<BoardImage>>,
     browser_drops: Option<BrowserDropQueue>,
+    trackpad_gesture: TrackpadGesture,
+}
+
+/// Tracks which trackpad gesture (pan or pinch-zoom) is currently "owned" so
+/// that residual finger drift during one doesn't also trigger the other.
+/// Real pinch/pan gestures on macOS are reported as separate events, but the
+/// two can leak into each other for a few frames around the start/end of the
+/// gesture, which otherwise reads as the canvas jittering.
+struct TrackpadGesture {
+    active: Option<GestureKind>,
+    last_active_at: std::time::Instant,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum GestureKind {
+    Pan,
+    Zoom,
+}
+
+impl Default for TrackpadGesture {
+    fn default() -> Self {
+        Self {
+            active: None,
+            last_active_at: std::time::Instant::now(),
+        }
+    }
+}
+
+impl TrackpadGesture {
+    /// How long one gesture continues to suppress the other after it stops
+    /// being detected, to absorb trailing drift.
+    const LOCK: std::time::Duration = std::time::Duration::from_millis(150);
+
+    /// Given this frame's raw zoom factor and pan delta, decide which one (if
+    /// any) should actually be applied.
+    fn resolve(&mut self, has_zoom: bool, has_pan: bool) -> Option<GestureKind> {
+        let locked = self.active.filter(|_| self.last_active_at.elapsed() < Self::LOCK);
+
+        let winner = match (has_zoom, has_pan, locked) {
+            (true, true, Some(kind)) => Some(kind),
+            // No gesture currently owns the lock: prefer zoom, since a
+            // genuine pinch is a more deliberate gesture than pan drift.
+            (true, true, None) => Some(GestureKind::Zoom),
+            (true, false, Some(GestureKind::Pan)) => None,
+            (true, false, _) => Some(GestureKind::Zoom),
+            (false, true, Some(GestureKind::Zoom)) => None,
+            (false, true, _) => Some(GestureKind::Pan),
+            (false, false, _) => None,
+        };
+
+        if let Some(kind) = winner {
+            self.active = Some(kind);
+            self.last_active_at = std::time::Instant::now();
+        }
+        winner
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -512,6 +568,7 @@ impl ReferenceBoardApp {
             history: History::default(),
             edit_before: None,
             browser_drops,
+            trackpad_gesture: TrackpadGesture::default(),
         }
     }
 
@@ -938,14 +995,24 @@ impl eframe::App for ReferenceBoardApp {
         }
 
         if response.hovered() && self.drag.is_none() {
-            let scroll = ui.input(|input| input.smooth_scroll_delta.y);
-            if scroll.abs() > f32::EPSILON {
-                let pointer = ui
-                    .input(|input| input.pointer.hover_pos())
-                    .unwrap_or(canvas_rect.center());
-                let zoom_factor = (scroll * 0.002).exp();
-                self.camera.zoom_at(pointer, zoom_factor, canvas_rect);
-                self.dirty = true;
+            let zoom_factor = ui.input(|input| input.zoom_delta());
+            let pan_delta = ui.input(|input| input.smooth_scroll_delta);
+            let has_zoom = (zoom_factor - 1.0).abs() > 0.0005;
+            let has_pan = pan_delta.length() > 0.01;
+
+            match self.trackpad_gesture.resolve(has_zoom, has_pan) {
+                Some(GestureKind::Zoom) => {
+                    let pointer = ui
+                        .input(|input| input.pointer.hover_pos())
+                        .unwrap_or(canvas_rect.center());
+                    self.camera.zoom_at(pointer, zoom_factor, canvas_rect);
+                    self.dirty = true;
+                }
+                Some(GestureKind::Pan) => {
+                    self.camera.pan += pan_delta;
+                    self.dirty = true;
+                }
+                None => {}
             }
         }
 
