@@ -1,6 +1,6 @@
 use crate::storage::{self, AssetData, Content, Item, Preview, Project};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions, Vec2};
 
@@ -9,6 +9,10 @@ const MAX_ZOOM: f32 = 16.0;
 const MAX_INITIAL_IMAGE_SIDE: f32 = 640.0;
 const PREVIEW_SIDE: u32 = 1024;
 const HISTORY_LIMIT: usize = 200;
+
+/// Raw (encoded) image bytes queued up by a platform-specific drag handler,
+/// polled once per frame. See `platform_macos` for the macOS producer.
+pub type BrowserDropQueue = Arc<Mutex<Vec<Vec<u8>>>>;
 
 pub struct ReferenceBoardApp {
     camera: Camera,
@@ -25,6 +29,7 @@ pub struct ReferenceBoardApp {
     allow_close: bool,
     history: History,
     edit_before: Option<Vec<BoardImage>>,
+    browser_drops: Option<BrowserDropQueue>,
 }
 
 #[derive(Clone, Copy)]
@@ -484,6 +489,11 @@ impl ReferenceBoardApp {
             }
         }
 
+        #[cfg(target_os = "macos")]
+        let browser_drops = crate::platform_macos::install(creation_context);
+        #[cfg(not(target_os = "macos"))]
+        let browser_drops = None;
+
         Self {
             camera: Camera::default(),
             images: Vec::new(),
@@ -499,6 +509,7 @@ impl ReferenceBoardApp {
             allow_close: false,
             history: History::default(),
             edit_before: None,
+            browser_drops,
         }
     }
 
@@ -545,6 +556,127 @@ impl ReferenceBoardApp {
             (0, _) => failures.join(" | "),
             (_, true) => format!("Added {loaded} image(s)"),
             (_, false) => format!("Added {loaded}; some failed: {}", failures.join(" | ")),
+        };
+    }
+
+    /// Decodes and inserts images from raw (encoded) bytes, sharing the
+    /// history/selection bookkeeping that file drops use. Returns
+    /// (loaded_count, failure_messages).
+    fn insert_images_from_bytes(
+        &mut self,
+        ctx: &egui::Context,
+        items: Vec<(Vec<u8>, String)>,
+        world_position: Pos2,
+    ) -> (usize, Vec<String>) {
+        let mut loaded = 0;
+        let mut failures = Vec::new();
+        let mut added = Vec::new();
+
+        for (index, (bytes, name)) in items.into_iter().enumerate() {
+            let cascade = Vec2::splat(index as f32 * 24.0);
+            match BoardImage::from_bytes(ctx, bytes, name, world_position + cascade) {
+                Ok(image) => {
+                    added.push(image);
+                    loaded += 1;
+                }
+                Err(error) => failures.push(error),
+            }
+        }
+
+        if !added.is_empty() {
+            self.history.record(self.images.clone());
+            self.images.extend(added);
+            self.dirty = true;
+            self.selected = Some(self.images.len() - 1);
+        }
+
+        (loaded, failures)
+    }
+
+    /// Polls images dragged in from a browser (see `platform_macos`), which
+    /// arrive as raw pasteboard bytes rather than through egui's own
+    /// `dropped_files` (winit never sees those drags at all).
+    fn handle_browser_drops(&mut self, ctx: &egui::Context, canvas_rect: Rect) {
+        let Some(queue) = self.browser_drops.clone() else {
+            return;
+        };
+        let bytes_list = match queue.lock() {
+            Ok(mut guard) if !guard.is_empty() => std::mem::take(&mut *guard),
+            _ => return,
+        };
+
+        let screen_position = ctx
+            .input(|i| i.pointer.hover_pos())
+            .unwrap_or(canvas_rect.center());
+        let world_position = self.camera.screen_to_world(screen_position, canvas_rect);
+        let items = bytes_list
+            .into_iter()
+            .enumerate()
+            .map(|(index, bytes)| (bytes, format!("Dropped image {}", index + 1)))
+            .collect();
+
+        let (loaded, failures) = self.insert_images_from_bytes(ctx, items, world_position);
+        self.status = match (loaded, failures.is_empty()) {
+            (0, _) => failures.join(" | "),
+            (_, true) => format!("Added {loaded} image(s) from browser drag"),
+            (_, false) => format!("Added {loaded}; some failed: {}", failures.join(" | ")),
+        };
+    }
+
+    /// Cmd+V (Ctrl+V on non-mac): pastes an image copied from a browser
+    /// ("Copy Image" on Chrome/Pinterest/etc.) via the system clipboard.
+    fn handle_clipboard_paste(&mut self, ctx: &egui::Context, canvas_rect: Rect) {
+        if self.editing.is_some() || self.pending.is_some() {
+            return;
+        }
+        let pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::V));
+        if !pressed {
+            return;
+        }
+
+        let mut clipboard = match arboard::Clipboard::new() {
+            Ok(clipboard) => clipboard,
+            Err(error) => {
+                self.status = format!("Clipboard unavailable: {error}");
+                return;
+            }
+        };
+        let clipboard_image = match clipboard.get_image() {
+            Ok(image) => image,
+            Err(error) => {
+                self.status = format!("No image on clipboard: {error}");
+                return;
+            }
+        };
+        let width = clipboard_image.width as u32;
+        let height = clipboard_image.height as u32;
+        let Some(rgba) = image::RgbaImage::from_raw(width, height, clipboard_image.bytes.into_owned())
+        else {
+            self.status = "Clipboard image had an unexpected size".to_owned();
+            return;
+        };
+        let mut encoded = Vec::new();
+        if let Err(error) = image::DynamicImage::ImageRgba8(rgba).write_to(
+            &mut std::io::Cursor::new(&mut encoded),
+            image::ImageFormat::Png,
+        ) {
+            self.status = format!("Failed to encode clipboard image: {error}");
+            return;
+        }
+
+        let screen_position = ctx
+            .input(|i| i.pointer.hover_pos())
+            .unwrap_or(canvas_rect.center());
+        let world_position = self.camera.screen_to_world(screen_position, canvas_rect);
+        let (loaded, failures) = self.insert_images_from_bytes(
+            ctx,
+            vec![(encoded, "Pasted image".to_owned())],
+            world_position,
+        );
+        self.status = if loaded > 0 {
+            "Pasted image from clipboard".to_owned()
+        } else {
+            failures.join(" | ")
         };
     }
 
@@ -800,6 +932,8 @@ impl eframe::App for ReferenceBoardApp {
         }
 
         self.handle_dropped_files(ui.ctx(), canvas_rect);
+        self.handle_browser_drops(ui.ctx(), canvas_rect);
+        self.handle_clipboard_paste(ui.ctx(), canvas_rect);
 
         let painter = ui.painter_at(canvas_rect);
         painter.rect_filled(canvas_rect, 0.0, Color32::from_rgb(28, 29, 32));
@@ -932,6 +1066,35 @@ impl BoardImage {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned(),
+            },
+            bytes: Some(Arc::new(bytes)),
+            preview: Some(preview),
+            world_position,
+            world_size: fit_initial_size(pixel_size),
+            rotation: 0.0,
+        })
+    }
+
+    /// Like `load`, but for bytes that didn't come from a file on disk yet
+    /// (a browser drag or a clipboard paste). `name` is used only for error
+    /// messages and the texture debug label.
+    fn from_bytes(
+        ctx: &egui::Context,
+        bytes: Vec<u8>,
+        name: String,
+        world_position: Pos2,
+    ) -> Result<Self, String> {
+        let asset = storage::asset_id(&bytes);
+        let (preview, pixel_size) = decode_preview(ctx, &bytes, Path::new(&name))?;
+        let texture = texture_from_preview(ctx, &format!("{name}-{asset}"), &preview);
+
+        Ok(Self {
+            _path: PathBuf::new(),
+            texture: Some(texture),
+            id: new_id(),
+            content: Content::Image {
+                asset,
+                original_name: name,
             },
             bytes: Some(Arc::new(bytes)),
             preview: Some(preview),
@@ -1099,6 +1262,23 @@ mod tests {
             world_size: Vec2::new(200.0, 100.0),
             rotation: std::f32::consts::FRAC_PI_2,
         }
+    }
+
+    #[test]
+    fn from_bytes_decodes_encoded_image_like_a_clipboard_paste() {
+        let ctx = egui::Context::default();
+        let rgba = image::RgbaImage::from_pixel(3, 2, image::Rgba([10, 20, 30, 255]));
+        let mut encoded = Vec::new();
+        image::DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut std::io::Cursor::new(&mut encoded), image::ImageFormat::Png)
+            .unwrap();
+
+        let image = BoardImage::from_bytes(&ctx, encoded, "Pasted image".into(), Pos2::new(5.0, 6.0))
+            .expect("valid PNG bytes should decode");
+
+        assert_eq!(image.world_position, Pos2::new(5.0, 6.0));
+        assert_eq!(image.world_size.x / image.world_size.y, 3.0 / 2.0);
+        assert!(matches!(image.content, Content::Image { .. }));
     }
 
     #[test]
