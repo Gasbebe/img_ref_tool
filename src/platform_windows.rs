@@ -163,9 +163,9 @@ fn registered_format(name: &str) -> u16 {
 }
 
 /// Reads the classic OLE "virtual file" drag pair: `FileGroupDescriptorW`
-/// lists how many virtual files there are (and their names, though we don't
-/// need those), and `FileContents` gives the bytes for item `i` via an
-/// `IStream` when requested with `lindex = i`.
+/// lists how many virtual files there are (and their names), and
+/// `FileContents` gives the bytes for item `i` via an `IStream` when
+/// requested with `lindex = i`.
 fn read_virtual_files(data_object: &IDataObject) -> Vec<Vec<u8>> {
     let descriptor_format = registered_format("FileGroupDescriptorW");
     let Some(descriptor_bytes) = read_global_format(data_object, descriptor_format) else {
@@ -182,23 +182,56 @@ fn read_virtual_files(data_object: &IDataObject) -> Vec<Vec<u8>> {
     let entry_size = std::mem::size_of::<FILEDESCRIPTORW>();
     let mut files = Vec::new();
     for index in 0..count {
-        // We only need the byte count check to avoid reading past the
-        // buffer; the file name/attributes in each entry aren't used.
-        if 4 + (index + 1) * entry_size > descriptor_bytes.len() {
+        let offset = 4 + index * entry_size;
+        if offset + entry_size > descriptor_bytes.len() {
             break;
         }
+        // SAFETY: `offset` was just checked to leave `entry_size` bytes in
+        // bounds; the struct is `packed(1)` so an unaligned read is correct.
+        let descriptor = unsafe {
+            (descriptor_bytes.as_ptr().add(offset) as *const FILEDESCRIPTORW).read_unaligned()
+        };
+        // Copy the field out by value first: `descriptor` is a packed
+        // struct, so a reference straight into `cFileName` would be
+        // unaligned even though we never dereference misaligned memory.
+        let file_name_raw = descriptor.cFileName;
+        let name_len = file_name_raw
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(file_name_raw.len());
+        let file_name = String::from_utf16_lossy(&file_name_raw[..name_len]);
+
         match read_file_contents(data_object, contents_format, index as i32) {
             Some(bytes) => {
                 eprintln!(
-                    "[img-ref-tool] drag: FileContents[{index}] = {} byte(s)",
-                    bytes.len()
+                    "[img-ref-tool] drag: FileContents[{index}] name={file_name:?} = {} byte(s){}",
+                    bytes.len(),
+                    text_preview(&bytes)
                 );
                 files.push(bytes);
             }
-            None => eprintln!("[img-ref-tool] drag: no data for FileContents[{index}]"),
+            None => eprintln!(
+                "[img-ref-tool] drag: no data for FileContents[{index}] name={file_name:?}"
+            ),
         }
     }
     files
+}
+
+/// Diagnostic: if a small virtual file's bytes look like plain text (e.g. an
+/// Internet Shortcut / .url file, which is what some sites drag instead of
+/// actual image bytes), show a preview so we can tell it apart from a real
+/// (binary) image payload in the logs.
+fn text_preview(bytes: &[u8]) -> String {
+    if bytes.len() > 2048 {
+        return String::new();
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(text) if text.chars().all(|c| !c.is_control() || c == '\n' || c == '\r') => {
+            format!(" text={text:?}")
+        }
+        _ => String::new(),
+    }
 }
 
 fn read_file_contents(data_object: &IDataObject, format: u16, index: i32) -> Option<Vec<u8>> {
